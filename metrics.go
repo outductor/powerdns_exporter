@@ -94,7 +94,7 @@ var (
         gaugeDefinition{5, "metadata_cache_size", "Number of entries in the metadata cache.", "meta-cache-size"},
         gaugeDefinition{6, "qsize", "Number of packets waiting for database attention.", "qsize-q"},
 
-        // ★ ここから追加（ID は衝突しなければ何番でもOK）
+        // Additional response type metrics
         gaugeDefinition{1001, "nxdomain_packets", "Number of NXDOMAIN responses.", "nxdomain-packets"},
         gaugeDefinition{1002, "servfail_packets", "Number of SERVFAIL responses.", "servfail-packets"},
         gaugeDefinition{1003, "noerror_packets",  "Number of NOERROR responses.",  "noerror-packets"},
@@ -127,7 +127,7 @@ var (
         },
         counterVecDefinition{
             7, "exceptions_total", "Total number of exceptions by error.", "error",
-            map[string]string{"servfail-packets": "servfail", "timedout-questions": "timeout", "udp-recvbuf-errors": "recvbuf-error", "udp-sndbuf-errors": "sndbuf-error"},
+            map[string]string{"servfail-packets": "servfail", "timedout-packets": "timeout", "udp-recvbuf-errors": "recvbuf-error", "udp-sndbuf-errors": "sndbuf-error"},
         },
     }
 )
