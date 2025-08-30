@@ -9,12 +9,17 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
+	"strconv"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/log"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
@@ -38,6 +43,9 @@ var (
 			},
 		},
 	}
+
+	// package-level logger (go-kit/log)
+	logger log.Logger
 )
 
 // ServerInfo is used to parse JSON data from 'server/localhost' endpoint
@@ -55,7 +63,7 @@ type ServerInfo struct {
 type StatsEntry struct {
 	Name  string  `json:"name"`
 	Kind  string  `json:"type"`
-	Value float64 `json:"value,string"`
+	Value json.RawMessage `json:"value"`
 }
 
 // Exporter collects PowerDNS stats from the given HostURL and exports them using
@@ -70,15 +78,15 @@ type Exporter struct {
 	totalScrapes      prometheus.Counter
 	jsonParseFailures prometheus.Counter
 	gaugeMetrics      map[int]prometheus.Gauge
-	counterVecMetrics map[int]*prometheus.CounterVec
+	counterVecMetrics map[int]*prometheus.GaugeVec
 	gaugeDefs         []gaugeDefinition
 	counterVecDefs    []counterVecDefinition
 	client            *http.Client
 }
 
-func newCounterVecMetric(serverType, metricName, docString string, labelNames []string) *prometheus.CounterVec {
-	return prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+func newCounterVecMetric(serverType, metricName, docString string, labelNames []string) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: serverType,
 			Name:      metricName,
@@ -105,7 +113,7 @@ func NewExporter(apiKey, serverType string, hostURL *url.URL) *Exporter {
 	var counterVecDefs []counterVecDefinition
 
 	gaugeMetrics := make(map[int]prometheus.Gauge)
-	counterVecMetrics := make(map[int]*prometheus.CounterVec)
+	counterVecMetrics := make(map[int]*prometheus.GaugeVec)
 
 	switch serverType {
 	case "recursor":
@@ -198,7 +206,7 @@ func (e *Exporter) scrape(jsonStats chan<- []StatsEntry) {
 	if err != nil {
 		e.up.Set(0)
 		e.jsonParseFailures.Inc()
-		log.Errorf("Error scraping PowerDNS: %v", err)
+		level.Error(logger).Log("msg", "error scraping PowerDNS", "err", err)
 		return
 	}
 
@@ -224,7 +232,7 @@ func (e *Exporter) collectMetrics(ch chan<- prometheus.Metric, statsMap map[stri
 	if e.ServerType == "recursor" {
 		h, err := makeRecursorRTimeHistogram(statsMap)
 		if err != nil {
-			log.Errorf("Could not create response time histogram: %v", err)
+			level.Error(logger).Log("msg", "could not create response time histogram", "err", err)
 			return
 		}
 		ch <- h
@@ -235,7 +243,21 @@ func (e *Exporter) setMetrics(jsonStats <-chan []StatsEntry) (statsMap map[strin
 	statsMap = make(map[string]float64)
 	stats := <-jsonStats
 	for _, s := range stats {
-		statsMap[s.Name] = s.Value
+		// 1) value が number の場合
+		var f float64
+		if err := json.Unmarshal(s.Value, &f); err == nil {
+			statsMap[s.Name] = f
+			continue
+		}
+		// 2) value が "123" のような string の場合
+		var str string
+		if err := json.Unmarshal(s.Value, &str); err == nil {
+			if vf, err := strconv.ParseFloat(str, 64); err == nil {
+				statsMap[s.Name] = vf
+			}
+			continue
+		}
+		// 3) それ以外（配列・オブジェクトなど）は無視（Map/RingStatisticItem）
 	}
 	if len(statsMap) == 0 {
 		return
@@ -249,7 +271,7 @@ func (e *Exporter) setMetrics(jsonStats <-chan []StatsEntry) (statsMap map[strin
 			}
 			e.gaugeMetrics[def.id].Set(value)
 		} else {
-			log.Errorf("Expected PowerDNS stats key not found: %s", def.key)
+			level.Error(logger).Log("msg", "expected PowerDNS stats key not found", "key", def.key)
 			e.jsonParseFailures.Inc()
 		}
 	}
@@ -259,7 +281,7 @@ func (e *Exporter) setMetrics(jsonStats <-chan []StatsEntry) (statsMap map[strin
 			if value, ok := statsMap[key]; ok {
 				e.counterVecMetrics[def.id].WithLabelValues(label).Set(value)
 			} else {
-				log.Errorf("Expected PowerDNS stats key not found: %s", key)
+				level.Error(logger).Log("msg", "expected PowerDNS stats key not found", "key", key)
 				e.jsonParseFailures.Inc()
 			}
 		}
@@ -300,7 +322,9 @@ func getJSON(url, apiKey string, data interface{}) error {
 		return fmt.Errorf(string(content))
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(data); err != nil {
+	dec := json.NewDecoder(resp.Body)
+	dec.UseNumber()
+	if err := dec.Decode(data); err != nil {
 		return err
 	}
 
@@ -317,28 +341,34 @@ func main() {
 	var (
 		listenAddress = flag.String("listen-address", ":9120", "Address to listen on for web interface and telemetry.")
 		metricsPath   = flag.String("metric-path", "/metrics", "Path under which to expose metrics.")
-		apiURL        = flag.String("api-url", "http://localhost:8001/", "Base-URL of PowerDNS authoritative server/recursor API.")
+		apiURLFlag    = flag.String("api-url", "http://localhost:8001/", "Base-URL of PowerDNS authoritative server/recursor API.")
 		apiKey        = flag.String("api-key", "", "PowerDNS API Key")
 	)
 	flag.Parse()
 
-	hostURL, err := url.Parse(*apiURL)
+	// init logger
+	logger = log.NewLogfmtLogger(os.Stdout)
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC, "caller", log.DefaultCaller)
+
+	hostURL, err := url.Parse(*apiURLFlag)
 	if err != nil {
-		log.Fatalf("Error parsing api-url: %v", err)
+		level.Error(logger).Log("msg", "error parsing api-url", "err", err)
+		os.Exit(1)
 	}
 
 	server, err := getServerInfo(hostURL, *apiKey)
 	if err != nil {
-		log.Fatalf("Could not fetch PowerDNS server info: %v", err)
+		level.Error(logger).Log("msg", "could not fetch PowerDNS server info", "err", err)
+		os.Exit(1)
 	}
 
 	exporter := NewExporter(*apiKey, server.DaemonType, hostURL)
 	prometheus.MustRegister(exporter)
 
-	log.Infof("Starting Server: %s", *listenAddress)
-	http.Handle(*metricsPath, prometheus.Handler())
+	level.Info(logger).Log("msg", "starting server", "addr", *listenAddress)
+	http.Handle(*metricsPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`<html>
+		_, _ = w.Write([]byte(`<html>
              <head><title>PowerDNS Exporter</title></head>
              <body>
              <h1>PowerDNS Exporter</h1>
@@ -346,5 +376,10 @@ func main() {
              </body>
              </html>`))
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+
+	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
+		level.Error(logger).Log("msg", "http server error", "err", err)
+		os.Exit(1)
+	}
 }
+

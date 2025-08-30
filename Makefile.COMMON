@@ -44,16 +44,40 @@ SRC    ?= $(shell find . -type f -name "*.go" ! -path "./.build/*")
 GOOS   ?= $(shell uname | tr A-Z a-z)
 GOARCH ?= $(subst x86_64,amd64,$(patsubst i%86,386,$(shell uname -m)))
 
-GO_VERSION ?= 1.5
+# ---- Go toolchain selection --------------------------------------------------
+
+# Required major.minor version (allows 1.24.*)
+GO_REQUIRED_MM ?= 1.24
+# Fallback version to download (including patch version)
+GO_VERSION ?= 1.24.6
+
+# Prioritize snap installation
+GO_SNAP ?= /snap/bin/go
+
 GOURL      ?= https://golang.org/dl
 GOPKG      ?= go$(GO_VERSION).$(GOOS)-$(GOARCH).tar.gz
 GOPATH     := $(CURDIR)/.build/gopath
 
-# Check for the correct version of go in the path. If we find it, use it.
-# Otherwise, prepare to build go locally.
-ifeq ($(shell command -v "go" >/dev/null && go version | sed -e 's/^[^0-9.]*\([0-9.]*\).*/\1/'), $(GO_VERSION))
-	GOCC   ?= $(shell command -v "go")
-	GOFMT  ?= $(shell command -v "gofmt")
+# 1) If /snap/bin/go exists and is version 1.24.*, use it with highest priority
+ifneq ($(wildcard $(GO_SNAP)),)
+SNAP_GOVERSION := $(shell "$(GO_SNAP)" env GOVERSION 2>/dev/null)
+endif
+
+# 2) If go in PATH exists and is version 1.24.*, use it as second priority
+PATH_GO      := $(shell command -v go 2>/dev/null)
+ifneq ($(PATH_GO),)
+PATH_GOVERSION := $(shell go env GOVERSION 2>/dev/null)
+endif
+
+# Priority: /snap/bin/go (1.24.*) -> go in PATH (1.24.*) -> local download
+ifeq ($(findstring go$(GO_REQUIRED_MM).,$(SNAP_GOVERSION)),go$(GO_REQUIRED_MM).)
+	GOCC   ?= $(GO_SNAP)
+	# Derive gofmt from GOROOT (reliable for snap as well)
+	GOFMT  ?= $(shell "$(GO_SNAP)" env GOROOT 2>/dev/null)/bin/gofmt
+	GO     ?= GOPATH=$(GOPATH) $(GOCC)
+else ifeq ($(findstring go$(GO_REQUIRED_MM).,$(PATH_GOVERSION)),go$(GO_REQUIRED_MM).)
+	GOCC   ?= $(PATH_GO)
+	GOFMT  ?= $(shell go env GOROOT 2>/dev/null)/bin/gofmt
 	GO     ?= GOPATH=$(GOPATH) $(GOCC)
 else
 	GOROOT ?= $(CURDIR)/.build/go$(GO_VERSION)
@@ -73,12 +97,12 @@ SELFLINK ?= $(GOPATH)/src/$(ROOTPKG)
 
 default: $(BINARY)
 
+# This target is only reached in "local download mode"
 $(GOCC):
-	@echo Go version $(GO_VERSION) required but not found in PATH.
-	@echo About to download and install go$(GO_VERSION) to $(GOROOT)
-	@echo Abort now if you want to manually install it system-wide instead.
+	@echo "Go $(GO_VERSION) not usable from snap/PATH. Bootstrapping local toolchain..."
+	@echo "About to download and install go$(GO_VERSION) to $(GOROOT)"
 	@echo
-	@sleep 5
+	@sleep 2
 	mkdir -p .build
 	# The archive contains a single directory called 'go/'.
 	curl -L $(GOURL)/$(GOPKG) | tar -C .build -xzf -
@@ -89,12 +113,26 @@ $(SELFLINK):
 	mkdir -p $(dir $@)
 	ln -s $(CURDIR) $@
 
+# ---- Dependencies ------------------------------------------------------------
+# Go 1.24 doesn't allow 'go get -d' outside modules.
+# If go.mod exists, use 'go mod download', otherwise show error with initialization instructions.
 dependencies-stamp: $(GOCC) $(SRC) | $(SELFLINK)
-	$(GO) get -d
-	touch $@
+	@if [ -f go.mod ]; then \
+		echo "==> go.mod detected; downloading dependencies"; \
+		$(GO) mod download; \
+	else \
+		echo "ERROR: go.mod not found. Modern Go (>=1.16) requires modules."; \
+		echo "       Initialize modules once, then re-run make:"; \
+		echo "         $(GOCC) mod init $(ROOTPKG)"; \
+		echo "         $(GOCC) mod tidy"; \
+		exit 2; \
+	fi
+	@touch $@
+
+# ---- Build / Test / Etc. -----------------------------------------------------
 
 $(BINARY): $(GOCC) $(SRC) dependencies-stamp Makefile Makefile.COMMON
-	$(GO) build $(GOFLAGS) -o $@
+	$(GO) build $(GOFLAGS) -o $@ ./...
 
 .PHONY: archive
 archive: $(ARCHIVE)
@@ -118,3 +156,4 @@ format: $(GOCC)
 .PHONY: clean
 clean:
 	rm -rf $(BINARY) $(ARCHIVE) .build *-stamp
+
